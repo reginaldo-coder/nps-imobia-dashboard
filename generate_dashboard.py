@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+NPS Imobia Dashboard Generator
+Busca dados do canal #nps_imobia no Slack e gera o index.html estático.
+Executado automaticamente pelo GitHub Actions a cada hora no horário comercial.
+"""
+
+import os
+import re
+import json
+from datetime import datetime, timezone
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+SLACK_TOKEN   = os.environ["SLACK_BOT_TOKEN"]
+CHANNEL_ID    = "C08D7RE9NAF"   # #nps_imobia
+MAX_MESSAGES  = 500             # quantas mensagens buscar (retrocede ~6 meses)
+OUTPUT_FILE   = "index.html"
+
+# ── SLACK CLIENT ─────────────────────────────────────────────────────────────
+client = WebClient(token=SLACK_TOKEN)
+
+def fetch_nps_messages(limit=MAX_MESSAGES):
+    """Busca mensagens do canal paginando até atingir o limite."""
+    messages = []
+    cursor = None
+    fetched = 0
+
+    while fetched < limit:
+        batch = min(100, limit - fetched)
+        kwargs = dict(channel=CHANNEL_ID, limit=batch)
+        if cursor:
+            kwargs["cursor"] = cursor
+
+        try:
+            resp = client.conversations_history(**kwargs)
+        except SlackApiError as e:
+            print(f"Erro ao buscar mensagens: {e}")
+            break
+
+        messages.extend(resp["messages"])
+        fetched += len(resp["messages"])
+
+        if resp.get("response_metadata", {}).get("next_cursor"):
+            cursor = resp["response_metadata"]["next_cursor"]
+        else:
+            break
+
+    return messages
+
+
+def parse_nps_entry(text, ts):
+    """Extrai dados de uma mensagem de NPS."""
+    if "Novo NPS recebido" not in text:
+        return None
+
+    def extract(pattern, default=None):
+        m = re.search(pattern, text)
+        return m.group(1).strip() if m else default
+
+    nome   = extract(r"\*Nome:\*\s*(.+)")
+    email  = extract(r"\*Email:\*.*?[|>](.+?)[\|>]", extract(r"\*Email:\*\s*(.+)"))
+    emp_id = extract(r"\*Empresa ID:\*\s*(\d+)")
+    loc    = extract(r"\*Locações:\*\s*(.+)")
+    tipo   = extract(r"\*Tipo de usuário:\*\s*(.+)")
+    nota_s = extract(r"\*Nota:\*\s*(\d+)")
+    pagina = extract(r"Página:\*.*?<https://meu\.imobia\.app(.*?)[|>]")
+
+    if nota_s is None:
+        return None
+
+    nota = int(nota_s)
+    pagina = pagina or "/"
+
+    # data a partir do timestamp Unix do Slack
+    dt = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    mes_key = dt.strftime("%b/%y").capitalize()
+    data_fmt = dt.strftime("%d/%m")
+
+    return {
+        "name":    nome or "—",
+        "email":   email or "—",
+        "emp_id":  emp_id or "—",
+        "locacoes": loc or "—",
+        "tipo":    tipo or "—",
+        "nota":    nota,
+        "pagina":  pagina,
+        "data":    data_fmt,
+        "mes":     mes_key,
+        "ts":      float(ts),
+    }
+
+
+def fetch_comments(messages):
+    """Mapeia comentários pelo nome do usuário (próxima mensagem com Comentário)."""
+    comments = {}
+    for i, msg in enumerate(messages):
+        text = msg.get("text", "")
+        if "Comentário da nota recebida" in text:
+            nome_m = re.search(r"\*Nome:\*\s*(.+)", text)
+            com_m  = re.search(r"\*Comentário:\*\s*(.+)", text)
+            if nome_m and com_m:
+                comments[nome_m.group(1).strip()] = com_m.group(1).strip()
+    return comments
+
+
+def build_dataset(messages):
+    """Retorna dicionário {mes: [entry, ...]} para os últimos 4 meses."""
+    comments = fetch_comments(messages)
+    entries  = []
+
+    for msg in messages:
+        entry = parse_nps_entry(msg.get("text", ""), msg["ts"])
+        if entry:
+            # tenta anexar comentário pelo nome
+            entry["comentario"] = comments.get(entry["name"], "")
+            entries.append(entry)
+
+    # Agrupa por mês (usa ordem cronológica)
+    month_map = {}
+    for e in sorted(entries, key=lambda x: x["ts"]):
+        month_map.setdefault(e["mes"], []).append(e)
+
+    # Últimos 4 meses com dados
+    ordered = list(month_map.items())[-4:]
+    return dict(ordered)
+
+
+# ── HTML TEMPLATE ─────────────────────────────────────────────────────────────
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NPS Imobia · Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<style>
+  :root {
+    --bg:#f5f4f0;--surface:#ffffff;--surface2:#eeecea;--border:rgba(0,0,0,0.08);
+    --text:#1a1917;--muted:#6b6a67;--accent:#1a4f8a;--accent-light:#e8eef6;
+    --green:#2d6a1f;--green-bg:#e8f5e3;--amber:#7a4d0a;--amber-bg:#fdf0dc;
+    --red:#8b2020;--red-bg:#fdeaea;--radius:12px;--radius-sm:8px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5;}
+  .sidebar{position:fixed;top:0;left:0;width:220px;height:100vh;background:var(--text);padding:28px 20px;display:flex;flex-direction:column;gap:4px;z-index:100;}
+  .sidebar-logo{font-family:'DM Serif Display',serif;font-size:20px;color:#fff;margin-bottom:28px;letter-spacing:-0.02em;}
+  .sidebar-logo span{color:#7eb3f7;}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--radius-sm);color:rgba(255,255,255,0.55);font-size:13px;cursor:pointer;transition:all 0.15s;border:none;background:none;width:100%;text-align:left;font-family:'DM Sans',sans-serif;}
+  .nav-item:hover{background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.9);}
+  .nav-item.active{background:rgba(255,255,255,0.12);color:#fff;font-weight:500;}
+  .nav-icon{width:18px;height:18px;flex-shrink:0;}
+  .sidebar-section{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:rgba(255,255,255,0.3);padding:16px 12px 6px;}
+  .sidebar-footer{margin-top:auto;padding:12px;border-radius:var(--radius-sm);background:rgba(255,255,255,0.06);}
+  .sidebar-footer p{font-size:11px;color:rgba(255,255,255,0.35);line-height:1.6;}
+  .main{margin-left:220px;padding:32px 36px;min-height:100vh;}
+  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;}
+  .topbar-title h1{font-family:'DM Serif Display',serif;font-size:26px;font-weight:400;letter-spacing:-0.02em;}
+  .topbar-title p{font-size:13px;color:var(--muted);margin-top:2px;}
+  .topbar-actions{display:flex;gap:10px;align-items:center;}
+  .live-dot{width:7px;height:7px;border-radius:50%;background:#2ecc71;animation:pulse 2s infinite;display:inline-block;}
+  @keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.4;}}
+  .month-tabs{display:flex;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:5px;width:fit-content;}
+  .month-tab{padding:7px 20px;border-radius:var(--radius-sm);font-size:13px;cursor:pointer;color:var(--muted);border:none;background:none;transition:all 0.15s;font-family:'DM Sans',sans-serif;}
+  .month-tab:hover{color:var(--text);}
+  .month-tab.active{background:var(--text);color:#fff;font-weight:500;}
+  .metrics-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px;}
+  .metric-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;transition:transform 0.15s,box-shadow 0.15s;position:relative;overflow:hidden;}
+  .metric-card:hover{transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,0.07);}
+  .metric-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;}
+  .metric-card.blue::before{background:var(--accent);}
+  .metric-card.green::before{background:#2ecc71;}
+  .metric-card.amber::before{background:#f39c12;}
+  .metric-card.red::before{background:#e74c3c;}
+  .metric-label{font-size:11px;font-weight:500;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);margin-bottom:10px;}
+  .metric-value{font-family:'DM Serif Display',serif;font-size:38px;line-height:1;color:var(--text);margin-bottom:8px;}
+  .metric-value.positive{color:var(--green);}
+  .metric-value.negative{color:var(--red);}
+  .metric-value.neutral{color:var(--amber);}
+  .metric-sub{font-size:12px;color:var(--muted);}
+  .delta{display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:600;padding:2px 7px;border-radius:20px;margin-top:6px;}
+  .delta.up{background:var(--green-bg);color:var(--green);}
+  .delta.down{background:var(--red-bg);color:var(--red);}
+  .delta.flat{background:var(--surface2);color:var(--muted);}
+  .charts-grid{display:grid;grid-template-columns:2fr 1fr;gap:16px;margin-bottom:24px;}
+  .chart-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;}
+  .chart-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:20px;}
+  .chart-title{font-size:14px;font-weight:600;color:var(--text);margin-bottom:3px;}
+  .chart-subtitle{font-size:12px;color:var(--muted);}
+  .bottom-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px;}
+  .feed-table{width:100%;border-collapse:collapse;font-size:13px;}
+  .feed-table th{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--muted);padding:0 12px 12px;text-align:left;border-bottom:1px solid var(--border);}
+  .feed-table td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:middle;}
+  .feed-table tr:last-child td{border-bottom:none;}
+  .feed-table tr:hover td{background:var(--bg);}
+  .score-pill{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;font-size:12px;font-weight:600;}
+  .badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:11px;font-weight:500;}
+  .badge-p{background:var(--green-bg);color:var(--green);}
+  .badge-n{background:var(--red-bg);color:var(--red);}
+  .badge-neu{background:var(--amber-bg);color:var(--amber);}
+  .gauge-wrapper{display:flex;flex-direction:column;align-items:center;padding:12px 0;}
+  .gauge-value{font-family:'DM Serif Display',serif;font-size:56px;line-height:1;margin-bottom:6px;}
+  .gauge-label{font-size:12px;color:var(--muted);margin-bottom:20px;text-align:center;}
+  .gauge-bar{width:100%;height:8px;border-radius:4px;background:var(--surface2);overflow:hidden;margin-bottom:8px;}
+  .gauge-fill{height:100%;border-radius:4px;transition:width 0.8s cubic-bezier(0.16,1,0.3,1);}
+  .gauge-labels{display:flex;justify-content:space-between;width:100%;font-size:10px;color:var(--muted);}
+  .page{display:none;}
+  .page.active{display:block;}
+  .stacked-legend{display:flex;justify-content:center;gap:16px;margin-top:14px;font-size:11px;color:var(--muted);}
+  .comment-item{padding:12px 0;border-bottom:1px solid var(--border);}
+  .comment-item:last-child{border-bottom:none;}
+  .comment-header{display:flex;align-items:center;gap:8px;margin-bottom:6px;}
+  .comment-text{font-size:13px;color:var(--muted);line-height:1.5;padding-left:38px;}
+  .avatar{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;flex-shrink:0;}
+  @keyframes fadeUp{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
+  .animate-in{animation:fadeUp 0.4s ease forwards;}
+  @media(max-width:1100px){.metrics-grid{grid-template-columns:repeat(2,1fr);}.charts-grid,.bottom-grid{grid-template-columns:1fr;}}
+  @media(max-width:768px){.sidebar{width:60px;padding:20px 10px;}.sidebar-logo,.nav-item span,.sidebar-section,.sidebar-footer{display:none;}.nav-item{justify-content:center;padding:10px;}.main{margin-left:60px;padding:20px;}}
+</style>
+</head>
+<body>
+<aside class="sidebar">
+  <div class="sidebar-logo">NPS<span>·</span>Imobia</div>
+  <div class="sidebar-section">Visão geral</div>
+  <button class="nav-item active" onclick="goPage('dashboard',this)">
+    <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M2 10a8 8 0 1116 0A8 8 0 012 10zm8-3a1 1 0 00-.867.5 1 1 0 11-1.731-1A3 3 0 0113 10a3 3 0 01-3 3 1 1 0 110-2 1 1 0 000-2 1 1 0 00-1-1z"/></svg>
+    <span>Dashboard</span>
+  </button>
+  <button class="nav-item" onclick="goPage('mensal',this)">
+    <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 3a1 1 0 000 2v8a2 2 0 002 2h2.586l-1.293 1.293a1 1 0 101.414 1.414L10 15.414l2.293 2.293a1 1 0 001.414-1.414L12.414 15H15a2 2 0 002-2V5a1 1 0 100-2H3zm11 4a1 1 0 10-2 0v4a1 1 0 102 0V7zm-3 1a1 1 0 10-2 0v3a1 1 0 102 0V8zM8 9a1 1 0 00-2 0v2a1 1 0 102 0V9z" clip-rule="evenodd"/></svg>
+    <span>Comparativo mensal</span>
+  </button>
+  <button class="nav-item" onclick="goPage('feed',this)">
+    <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 5v8a2 2 0 01-2 2h-5l-5 4v-4H4a2 2 0 01-2-2V5a2 2 0 012-2h12a2 2 0 012 2zM7 8H5v2h2V8zm2 0h2v2H9V8zm6 0h-2v2h2V8z" clip-rule="evenodd"/></svg>
+    <span>Feed de respostas</span>
+  </button>
+  <button class="nav-item" onclick="goPage('comentarios',this)">
+    <svg class="nav-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 13V5a2 2 0 00-2-2H4a2 2 0 00-2 2v8a2 2 0 002 2h3l3 3 3-3h3a2 2 0 002-2zM5 7a1 1 0 011-1h8a1 1 0 110 2H6a1 1 0 01-1-1zm1 3a1 1 0 000 2h3a1 1 0 000-2H6z" clip-rule="evenodd"/></svg>
+    <span>Comentários</span>
+  </button>
+  <div class="sidebar-footer">
+    <p>Canal: #nps_imobia<br>Atualizado:<br>__UPDATED_AT__</p>
+  </div>
+</aside>
+
+<main class="main">
+  <div class="page active" id="page-dashboard">
+    <div class="topbar">
+      <div class="topbar-title">
+        <h1>Dashboard NPS</h1>
+        <p><span class="live-dot"></span> Atualizado às __UPDATED_AT__ · #nps_imobia</p>
+      </div>
+      <div class="topbar-actions">
+        <div class="month-tabs" id="month-tabs">__MONTH_TABS__</div>
+      </div>
+    </div>
+    <div class="metrics-grid" id="metric-cards"></div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-header"><div><div class="chart-title">Distribuição das notas</div><div class="chart-subtitle">Frequência por nota (0–10)</div></div></div>
+        <div style="position:relative;height:220px;"><canvas id="distChart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header"><div><div class="chart-title">Score NPS</div><div class="chart-subtitle">Promotores − Detratores</div></div></div>
+        <div class="gauge-wrapper">
+          <div class="gauge-value" id="gauge-value"></div>
+          <div class="gauge-label" id="gauge-label"></div>
+          <div style="width:100%">
+            <div class="gauge-bar"><div class="gauge-fill" id="gauge-fill"></div></div>
+            <div class="gauge-labels"><span>-100</span><span>0</span><span>+100</span></div>
+          </div>
+          <div style="display:flex;gap:10px;margin-top:16px;width:100%;">
+            <div style="flex:1;background:var(--green-bg);border-radius:var(--radius-sm);padding:10px;text-align:center;">
+              <div style="font-size:20px;font-weight:600;color:var(--green)" id="g-promo"></div>
+              <div style="font-size:10px;color:var(--muted);margin-top:2px">Promotores</div>
+            </div>
+            <div style="flex:1;background:var(--amber-bg);border-radius:var(--radius-sm);padding:10px;text-align:center;">
+              <div style="font-size:20px;font-weight:600;color:var(--amber)" id="g-neut"></div>
+              <div style="font-size:10px;color:var(--muted);margin-top:2px">Neutros</div>
+            </div>
+            <div style="flex:1;background:var(--red-bg);border-radius:var(--radius-sm);padding:10px;text-align:center;">
+              <div style="font-size:20px;font-weight:600;color:var(--red)" id="g-det"></div>
+              <div style="font-size:10px;color:var(--muted);margin-top:2px">Detratores</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="bottom-grid">
+      <div class="chart-card">
+        <div class="chart-header"><div><div class="chart-title">Páginas mais avaliadas</div><div class="chart-subtitle">Volume por URL</div></div></div>
+        <div style="position:relative;height:200px;"><canvas id="pagesChart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header"><div><div class="chart-title">Últimas avaliações</div><div class="chart-subtitle">Respostas mais recentes</div></div></div>
+        <div id="recent-feed" style="max-height:220px;overflow-y:auto;"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="page" id="page-mensal">
+    <div class="topbar"><div class="topbar-title"><h1>Comparativo Mensal</h1><p>Últimos 4 meses</p></div></div>
+    <div class="metrics-grid" id="monthly-cards"></div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-header"><div><div class="chart-title">Evolução do Score NPS</div><div class="chart-subtitle">Variação mensal</div></div></div>
+        <div style="position:relative;height:220px;"><canvas id="npsLine"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-header"><div><div class="chart-title">Nota média mensal</div><div class="chart-subtitle">Escala 0–10</div></div></div>
+        <div style="position:relative;height:220px;"><canvas id="avgLine"></canvas></div>
+      </div>
+    </div>
+    <div class="chart-card" style="margin-bottom:24px">
+      <div class="chart-header"><div><div class="chart-title">Distribuição por categoria mês a mês</div></div></div>
+      <div style="position:relative;height:220px;"><canvas id="stackedBar"></canvas></div>
+      <div class="stacked-legend">
+        <span style="display:flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;border-radius:2px;background:#2ecc71;display:inline-block"></span>Promotores (9–10)</span>
+        <span style="display:flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;border-radius:2px;background:#f39c12;display:inline-block"></span>Neutros (7–8)</span>
+        <span style="display:flex;align-items:center;gap:5px;"><span style="width:10px;height:10px;border-radius:2px;background:#e74c3c;display:inline-block"></span>Detratores (0–6)</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="page" id="page-feed">
+    <div class="topbar">
+      <div class="topbar-title"><h1>Feed de Respostas</h1><p>Todas as avaliações</p></div>
+      <div class="topbar-actions">
+        <select id="feed-filter" onchange="renderFeedPage()" style="padding:7px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);color:var(--text);font-family:'DM Sans',sans-serif;font-size:13px;cursor:pointer;">
+          <option value="all">Todos</option><option value="promotor">Promotores</option>
+          <option value="neutro">Neutros</option><option value="detrator">Detratores</option>
+        </select>
+      </div>
+    </div>
+    <div class="chart-card">
+      <table class="feed-table">
+        <thead><tr><th>Data</th><th>Nome</th><th>Nota</th><th>Categoria</th><th>Mês</th><th>Comentário</th></tr></thead>
+        <tbody id="feed-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="page" id="page-comentarios">
+    <div class="topbar"><div class="topbar-title"><h1>Comentários</h1><p>Feedback qualitativo</p></div></div>
+    <div class="bottom-grid">
+      <div class="chart-card"><div class="chart-title" style="margin-bottom:16px">Críticos / Neutros</div><div id="neg-comments"></div></div>
+      <div class="chart-card"><div class="chart-title" style="margin-bottom:16px">Positivos / Construtivos</div><div id="pos-comments"></div></div>
+    </div>
+  </div>
+</main>
+
+<script>
+const DATA = __DATA_JSON__;
+
+function calcStats(notas) {
+  const t = notas.length;
+  if (!t) return {total:0,promotores:0,detratores:0,neutros:0,score:0,avg:'0.0'};
+  const p = notas.filter(n=>n>=9).length, d = notas.filter(n=>n<=6).length;
+  return {total:t,promotores:p,detratores:d,neutros:t-p-d,
+    score:Math.round(((p-d)/t)*100), avg:(notas.reduce((s,n)=>s+n,0)/t).toFixed(1)};
+}
+
+function scoreColor(n){return n>=9?'var(--green)':n>=7?'var(--amber)':'var(--red)';}
+function scoreBg(n){return n>=9?'var(--green-bg)':n>=7?'var(--amber-bg)':'var(--red-bg)';}
+function catLabel(n){return n>=9?'promotor':n>=7?'neutro':'detrator';}
+function catClass(n){return n>=9?'badge-p':n>=7?'badge-neu':'badge-n';}
+function initials(name){return name.split(' ').slice(0,2).map(w=>w[0]||'').join('').toUpperCase();}
+
+const MONTH_COLORS=['#B5D4F4','#7eb3f7','#378ADD','#1a4f8a'];
+let currentMonth=Object.keys(DATA)[Object.keys(DATA).length-1];
+let distChart,pagesChart;
+
+function renderDashboard(){
+  const data=DATA[currentMonth]||[];
+  const notas=data.map(d=>d.nota);
+  const stats=calcStats(notas);
+  const months=Object.keys(DATA);
+  const idx=months.indexOf(currentMonth);
+  const prev=idx>0?calcStats(DATA[months[idx-1]].map(d=>d.nota)):null;
+  const delta=prev?stats.score-prev.score:null;
+
+  const mc=document.getElementById('metric-cards');
+  mc.innerHTML='';
+  [
+    {label:'Score NPS',color:'blue',value:stats.score,vc:stats.score>=50?'positive':stats.score>=0?'neutral':'negative',sub:`${stats.total} respostas no mês`,d:delta},
+    {label:'Nota média',color:'green',value:stats.avg,vc:parseFloat(stats.avg)>=9?'positive':parseFloat(stats.avg)>=7?'neutral':'negative',sub:'Escala 0 a 10',d:prev?(parseFloat(stats.avg)-parseFloat(prev.avg)).toFixed(1):null},
+    {label:'Promotores',color:'green',value:stats.promotores,vc:'positive',sub:`${Math.round(stats.promotores/Math.max(stats.total,1)*100)}% das respostas`,d:null},
+    {label:'Detratores',color:'red',value:stats.detratores,vc:'negative',sub:`${Math.round(stats.detratores/Math.max(stats.total,1)*100)}% das respostas`,d:null},
+  ].forEach((c,i)=>{
+    const dHtml=c.d!==null?`<span class="delta ${c.d>0?'up':c.d<0?'down':'flat'}">${c.d>0?'▲ +':'▼ '}${c.d} vs mês ant.</span>`:'';
+    mc.innerHTML+=`<div class="metric-card ${c.color} animate-in" style="animation-delay:${i*0.07}s">
+      <div class="metric-label">${c.label}</div>
+      <div class="metric-value ${c.vc}">${c.value}</div>
+      <div class="metric-sub">${c.sub}</div>${dHtml}</div>`;
+  });
+
+  document.getElementById('gauge-value').textContent=stats.score;
+  document.getElementById('gauge-value').className=`gauge-value ${stats.score>=50?'positive':stats.score>=0?'neutral':'negative'}`;
+  document.getElementById('gauge-label').textContent=stats.score>=50?'🏆 Excelente':stats.score>=0?'👍 Bom':'⚠️ Atenção';
+  const fill=document.getElementById('gauge-fill');
+  fill.style.width=((stats.score+100)/200*100)+'%';
+  fill.style.background=stats.score>=50?'#2ecc71':stats.score>=0?'#f39c12':'#e74c3c';
+  document.getElementById('g-promo').textContent=stats.promotores;
+  document.getElementById('g-neut').textContent=stats.neutros;
+  document.getElementById('g-det').textContent=stats.detratores;
+
+  const notaDist=Array(11).fill(0);
+  data.forEach(d=>notaDist[d.nota]++);
+  if(distChart)distChart.destroy();
+  distChart=new Chart(document.getElementById('distChart'),{
+    type:'bar',data:{labels:['0','1','2','3','4','5','6','7','8','9','10'],
+    datasets:[{data:notaDist,backgroundColor:notaDist.map((_,i)=>i>=9?'#2ecc71':i>=7?'#f39c12':'#e74c3c'),borderRadius:5,borderSkipped:false}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+    scales:{x:{grid:{display:false},ticks:{font:{size:11,family:'DM Sans'}}},
+    y:{grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:11,family:'DM Sans'},stepSize:1}}}}
+  });
+
+  const pc={};data.forEach(d=>{pc[d.pagina]=(pc[d.pagina]||0)+1;});
+  const sorted=Object.entries(pc).sort((a,b)=>b[1]-a[1]).slice(0,6);
+  if(pagesChart)pagesChart.destroy();
+  pagesChart=new Chart(document.getElementById('pagesChart'),{
+    type:'bar',indexAxis:'y',
+    data:{labels:sorted.map(p=>p[0]),datasets:[{data:sorted.map(p=>p[1]),backgroundColor:'#378ADD',borderRadius:4,borderSkipped:false}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+    scales:{x:{grid:{color:'rgba(0,0,0,0.04)'},ticks:{stepSize:1,font:{size:11,family:'DM Sans'}}},
+    y:{grid:{display:false},ticks:{font:{size:11,family:'DM Sans'}}}}}
+  });
+
+  document.getElementById('recent-feed').innerHTML=data.slice(0,8).map(d=>`
+    <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
+      <span class="score-pill" style="background:${scoreBg(d.nota)};color:${scoreColor(d.nota)}">${d.nota}</span>
+      <div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${d.name}</div>
+      <div style="font-size:11px;color:var(--muted)">${d.data}</div></div>
+      <span class="badge ${catClass(d.nota)}">${catLabel(d.nota)}</span>
+    </div>`).join('')+`<div style="padding-top:10px;font-size:12px;color:var(--muted);text-align:center">8 de ${data.length} respostas</div>`;
+}
+
+function setMonth(m,btn){
+  currentMonth=m;
+  document.querySelectorAll('.month-tab').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  renderDashboard();
+}
+
+function renderMonthly(){
+  const months=Object.keys(DATA);
+  const stats={};
+  months.forEach(m=>{stats[m]=calcStats(DATA[m].map(d=>d.nota));});
+  const mc2=document.getElementById('monthly-cards');mc2.innerHTML='';
+  months.forEach((m,i)=>{
+    const s=stats[m],prev=i>0?stats[months[i-1]]:null,diff=prev?s.score-prev.score:null;
+    const dHtml=diff!==null?`<span class="delta ${diff>0?'up':diff<0?'down':'flat'}">${diff>0?'▲ +':'▼ '}${diff} vs ${months[i-1]}</span>`:`<span class="delta flat">Início</span>`;
+    const col=s.score>=50?'var(--green)':s.score>=0?'var(--amber)':'var(--red)';
+    mc2.innerHTML+=`<div class="metric-card animate-in" style="animation-delay:${i*0.07}s;border-top:3px solid ${MONTH_COLORS[i]||'#378ADD'}">
+      <div class="metric-label">${m}</div><div class="metric-value" style="color:${col}">${s.score}</div>
+      <div class="metric-sub">${s.total} respostas · média ${s.avg}</div>${dHtml}</div>`;
+  });
+  new Chart(document.getElementById('npsLine'),{type:'line',data:{labels:months,
+    datasets:[{data:months.map(m=>stats[m].score),borderColor:'#1a4f8a',backgroundColor:'rgba(26,79,138,0.07)',
+    tension:0.3,pointRadius:7,pointBackgroundColor:months.map(m=>stats[m].score>=50?'#2ecc71':stats[m].score>=0?'#f39c12':'#e74c3c'),
+    pointBorderColor:'#fff',pointBorderWidth:2,fill:true,borderWidth:2}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+    scales:{x:{grid:{display:false},ticks:{font:{size:12,family:'DM Sans'}}},
+    y:{grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:11,family:'DM Sans'}}}}}});
+  new Chart(document.getElementById('avgLine'),{type:'line',data:{labels:months,
+    datasets:[{data:months.map(m=>parseFloat(stats[m].avg)),borderColor:'#2ecc71',backgroundColor:'rgba(46,204,113,0.07)',
+    tension:0.3,pointRadius:6,pointBackgroundColor:'#2ecc71',pointBorderColor:'#fff',pointBorderWidth:2,fill:true,borderWidth:2}]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+    scales:{x:{grid:{display:false},ticks:{font:{size:12,family:'DM Sans'}}},
+    y:{min:7,max:10,grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:11,family:'DM Sans'}}}}}});
+  new Chart(document.getElementById('stackedBar'),{type:'bar',data:{labels:months,
+    datasets:[
+      {label:'Promotores',data:months.map(m=>Math.round(stats[m].promotores/stats[m].total*100)),backgroundColor:'#2ecc71'},
+      {label:'Neutros',data:months.map(m=>Math.round(stats[m].neutros/stats[m].total*100)),backgroundColor:'#f39c12'},
+      {label:'Detratores',data:months.map(m=>Math.round(stats[m].detratores/stats[m].total*100)),backgroundColor:'#e74c3c'},
+    ]},
+    options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:(c)=>` ${c.dataset.label}: ${c.raw}%`}}},
+    scales:{x:{stacked:true,grid:{display:false},ticks:{font:{size:12,family:'DM Sans'}}},
+    y:{stacked:true,min:0,max:100,grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:11,family:'DM Sans'},callback:v=>v+'%'}}}}});
+}
+
+function renderFeedPage(){
+  const filter=document.getElementById('feed-filter').value;
+  const all=Object.entries(DATA).flatMap(([m,arr])=>arr.map(d=>({...d,mes:m})));
+  const filtered=filter==='all'?all:all.filter(d=>catLabel(d.nota)===filter);
+  document.getElementById('feed-body').innerHTML=filtered.map(d=>`<tr>
+    <td style="color:var(--muted)">${d.data}</td>
+    <td style="font-weight:500">${d.name}</td>
+    <td><span class="score-pill" style="background:${scoreBg(d.nota)};color:${scoreColor(d.nota)}">${d.nota}</span></td>
+    <td><span class="badge ${catClass(d.nota)}">${catLabel(d.nota)}</span></td>
+    <td style="color:var(--muted)">${d.mes}</td>
+    <td style="color:var(--muted);font-size:12px;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${d.comentario||'—'}</td></tr>`).join('');
+}
+
+function renderComments(){
+  const all=Object.entries(DATA).flatMap(([m,arr])=>arr.map(d=>({...d,mes:m}))).filter(d=>d.comentario);
+  const commentHTML=d=>{
+    const colors=['#EAF3DE','#e8eef6','#fdf0dc','#fdeaea'];
+    const tc=['var(--green)','var(--accent)','var(--amber)','var(--red)'];
+    const ci=d.nota>=9?0:d.nota>=7?1:d.nota>=4?2:3;
+    return `<div class="comment-item"><div class="comment-header">
+      <div class="avatar" style="background:${colors[ci]};color:${tc[ci]}">${initials(d.name)}</div>
+      <div><div style="font-size:13px;font-weight:500">${d.name}</div>
+      <div style="font-size:11px;color:var(--muted)">${d.data} · ${d.mes} · nota <strong style="color:${scoreColor(d.nota)}">${d.nota}</strong></div></div>
+    </div><div class="comment-text">${d.comentario}</div></div>`;
+  };
+  document.getElementById('neg-comments').innerHTML=all.filter(d=>d.nota<=7).map(commentHTML).join('');
+  document.getElementById('pos-comments').innerHTML=all.filter(d=>d.nota>=8).map(commentHTML).join('')||'<p style="color:var(--muted);font-size:13px">Nenhum comentário positivo.</p>';
+}
+
+let monthlyRendered=false;
+function goPage(page,btn){
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
+  document.getElementById('page-'+page).classList.add('active');
+  btn.classList.add('active');
+  if(page==='mensal'&&!monthlyRendered){renderMonthly();monthlyRendered=true;}
+  if(page==='feed')renderFeedPage();
+  if(page==='comentarios')renderComments();
+}
+
+renderDashboard();
+</script>
+</body>
+</html>
+"""
+
+
+def generate_html(dataset):
+    """Substitui os placeholders no template com os dados reais."""
+    now_br = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M") + " UTC"
+
+    months = list(dataset.keys())
+    current_month = months[-1] if months else ""
+
+    # Month tabs
+    tabs_html = ""
+    for m in months:
+        active = "active" if m == current_month else ""
+        tabs_html += f'<button class="month-tab {active}" onclick="setMonth(\'{m}\',this)">{m}</button>'
+
+    # Serializa dataset para JSON seguro
+    data_json = json.dumps(dataset, ensure_ascii=False)
+
+    html = HTML_TEMPLATE
+    html = html.replace("__UPDATED_AT__", now_br)
+    html = html.replace("__MONTH_TABS__", tabs_html)
+    html = html.replace("__DATA_JSON__", data_json)
+    return html
+
+
+def main():
+    print("🔄 Buscando mensagens do Slack...")
+    messages = fetch_nps_messages()
+    print(f"   {len(messages)} mensagens obtidas.")
+
+    dataset = build_dataset(messages)
+    total = sum(len(v) for v in dataset.values())
+    print(f"   {total} respostas NPS em {len(dataset)} meses: {list(dataset.keys())}")
+
+    html = generate_html(dataset)
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"✅ {OUTPUT_FILE} gerado com sucesso ({len(html)//1024} KB).")
+
+
+if __name__ == "__main__":
+    main()
